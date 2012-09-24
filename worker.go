@@ -1,11 +1,17 @@
 package main
 
 import (
+	"errors"
 	"fmt"
+	"github.com/temoto/http-client/heroshi"  // Temporary location
+	"github.com/temoto/http-client/limitmap" // Temporary location
 	"github.com/temoto/robotstxt.go"
+	"net"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
+	"unicode"
 	// Cache:
 	//"github.com/hoisie/redis.go"
 	//"json"
@@ -23,6 +29,10 @@ type Worker struct {
 	// How many redirects to follow. Default is 1.
 	FollowRedirects uint
 
+	// Timeout to resolve domain name (if needed) and establish TCP.
+	// Default is 1 second. 0 disables timeout.
+	ConnectTimeout time.Duration
+
 	// Timeout for single socket read or write.
 	// Default is 1 second. 0 disables timeout.
 	IOTimeout time.Duration
@@ -38,48 +48,60 @@ type Worker struct {
 	// Maximum number of connections per domain:port pair. Default is 2.
 	DomainConcurrency uint
 
-	// HTTP client. Has pool of persistent connections to each host.
-	client Client
+	// User-Agent as it's sent to server
+	// robotsAgent (first word of UserAgent) is verified against robots.txt.
+	UserAgent   string
+	robotsAgent string
 
 	//cache redis.Client
+	domainLimits *limitmap.LimitMap
+	transport    *heroshi.Transport
 }
 
 func newWorker() *Worker {
 	w := &Worker{
 		FollowRedirects:   1,
-		IOTimeout:         time.Duration(1) * time.Second,
-		FetchTimeout:      time.Duration(60) * time.Second,
+		ConnectTimeout:    1 * time.Second,
+		IOTimeout:         1 * time.Second,
+		FetchTimeout:      60 * time.Second,
 		KeepAlive:         60,
 		DomainConcurrency: 2,
+		UserAgent:         "HeroshiBot/1 (unknown_owner; +http://temoto.github.com/heroshi/)",
+		domainLimits:      limitmap.NewLimitMap(),
+		transport: &heroshi.Transport{
+			Dial:                Dial,
+			MaxIdleConnsPerHost: 1,
+		},
 	}
-	go w.cleanIdleConnections()
+	w.robotsAgent = FirstWord(w.UserAgent)
 	return w
-}
-
-func (w *Worker) cleanIdleConnections() {
-	time.Sleep(time.Duration(w.KeepAlive) * time.Second)
-	//FIXME: w.client.HttpClient.Transport.CloseIdleConnections()
-	go w.cleanIdleConnections()
 }
 
 // Downloads url and returns whatever result was.
 // This function WILL NOT follow redirects.
-func (w *Worker) Download(url *url.URL) (result *FetchResult) {
+func (w *Worker) Download(url *url.URL) (result *heroshi.FetchResult) {
+	w.domainLimits.Acquire(url.Host, w.DomainConcurrency)
+	defer w.domainLimits.Release(url.Host)
+
 	req, err := http.NewRequest("GET", url.String(), nil)
 	if err != nil {
-		return ErrorResult(url.String(), err.Error())
+		return heroshi.ErrorResult(url, err.Error())
 	}
-	req.Header.Set("User-Agent", "HeroshiBot/0.3 (+http://temoto.github.com/heroshi/; temotor@gmail.com)")
+	req.Header.Set("User-Agent", w.UserAgent)
 
-	options := &FetchOptions{
-		IOTimeout:    w.IOTimeout,
-		TotalTimeout: w.FetchTimeout,
+	options := &heroshi.RequestOptions{
+		ConnectTimeout: w.IOTimeout,
+		ReadTimeout:    w.IOTimeout,
+		WriteTimeout:   w.IOTimeout,
+		ReadLimit:      10 << 20, //10MB
+		Stat:           new(heroshi.RequestStat),
 	}
-	result = w.client.Fetch(req, options)
-	// TODO: do not even fetch whole response body, just wait for its end
+	result = heroshi.Fetch(w.transport, req, options, w.FetchTimeout)
 	if w.SkipBody {
 		result.Body = nil
 	}
+	result.Stat = options.Stat
+	w.transport.CloseIdleConnections(false)
 
 	return result
 }
@@ -102,14 +124,19 @@ func (w *Worker) CacheOrDownload(url *url.URL) *FetchResult {
 }
 */
 
-func (w *Worker) Fetch(url *url.URL) (result *FetchResult) {
-	original_url := *url
+func (w *Worker) Fetch(url *url.URL) (result *heroshi.FetchResult) {
+	original_url := url
 	started := time.Now()
+	defer func() {
+		if result != nil {
+			ended := time.Now()
+			result.TotalTime = uint((ended.Sub(started)) / time.Millisecond)
+		}
+	}()
 
 	for redirect := uint(0); redirect <= w.FollowRedirects; redirect++ {
 		if url.Scheme == "" || url.Host == "" {
-			result = ErrorResult(url.String(), "Incorrect URL: "+url.String())
-			break
+			return heroshi.ErrorResult(url, "Incorrect URL: "+url.String())
 		}
 
 		// The /robots.txt is always allowed, check others.
@@ -118,7 +145,7 @@ func (w *Worker) Fetch(url *url.URL) (result *FetchResult) {
 			var allow bool
 			allow, result = w.AskRobots(url)
 			if !allow {
-				break
+				return result
 			}
 		}
 
@@ -129,25 +156,22 @@ func (w *Worker) Fetch(url *url.URL) (result *FetchResult) {
 			var err error
 			url, err = url.Parse(location)
 			if err != nil {
-				result = ErrorResult(original_url.String(), err.Error())
-				break
+				return heroshi.ErrorResult(original_url, err.Error())
 			}
 			continue
 		}
 
 		// no redirects required
-		break
+		return result
 	}
-	ended := time.Now()
-	result.TotalTime = uint((ended.Sub(started)) / 1e6) // in milliseconds
 	return result
 }
 
-func (w *Worker) AskRobots(url *url.URL) (bool, *FetchResult) {
+func (w *Worker) AskRobots(url *url.URL) (bool, *heroshi.FetchResult) {
 	robots_url_str := fmt.Sprintf("%s://%s/robots.txt", url.Scheme, url.Host)
 	robots_url, err := url.Parse(robots_url_str)
 	if err != nil {
-		return false, ErrorResult(url.String(), err.Error())
+		return false, heroshi.ErrorResult(url, err.Error())
 	}
 
 	fetch_result := w.Fetch(robots_url)
@@ -164,17 +188,56 @@ func (w *Worker) AskRobots(url *url.URL) (bool, *FetchResult) {
 		return false, fetch_result
 	}
 
-	robots.DefaultAgent = "HeroshiBot"
-
 	var allow bool
-	allow, err = robots.Test(url.Path)
+	allow, err = robots.TestAgent(url.Path, w.UserAgent)
 	if err != nil {
-		return false, ErrorResult(url.String(), "Robots test error: "+err.Error())
+		return false, heroshi.ErrorResult(url, "Robots test error: "+err.Error())
 	}
 
 	if !allow {
-		return allow, ErrorResult(url.String(), "Robots disallow")
+		return allow, heroshi.ErrorResult(url, "Robots disallow")
 	}
 
 	return allow, nil
+}
+
+func Dial(netw, addr string, options *heroshi.RequestOptions) (net.Conn, error) {
+	var conn net.Conn
+	var err error
+	if options != nil && options.ConnectTimeout != 0 {
+		conn, err = net.DialTimeout(netw, addr, options.ConnectTimeout)
+	} else {
+		conn, err = net.Dial(netw, addr)
+	}
+	if err != nil {
+		return conn, err
+	}
+	tcp_conn, ok := conn.(*net.TCPConn)
+	if !ok {
+		return conn, errors.New("Dial: conn->TCPConn type assertion failed.")
+	}
+	tcp_conn.SetKeepAlive(true)
+	tcp_conn.SetLinger(0)
+	tcp_conn.SetNoDelay(true)
+	return tcp_conn, err
+}
+
+func FirstWord(s string) string {
+	i := strings.IndexFunc(s, func(r rune) bool { return !unicode.IsLetter(r) })
+	if i != -1 {
+		return s[0:i]
+	}
+	return s
+}
+
+// True if the specified HTTP status code is one for which the Get utility should
+// automatically redirect.
+func ShouldRedirect(statusCode int) bool {
+	switch statusCode {
+	case http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther,
+		http.StatusTemporaryRedirect:
+		//
+		return true
+	}
+	return false
 }

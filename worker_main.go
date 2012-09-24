@@ -6,8 +6,9 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"flag"
-	"fmt"
+	"github.com/temoto/http-client/heroshi" // Temporary location
 	"io"
+	"log"
 	"net/url"
 	"os"
 	"os/signal"
@@ -16,9 +17,6 @@ import (
 	"time"
 )
 
-const HeroshiTimeFormat = "2006-01-02T15:04:05"
-const DefaultConcurrency = 1000
-
 var urls chan *url.URL
 var reports chan []byte
 
@@ -26,46 +24,49 @@ func handleSigInt(ch <-chan os.Signal) {
 	defer close(urls)
 
 	<-ch
-	fmt.Fprintln(os.Stderr, "Waiting for remaining requests to complete.")
+	log.Println("Waiting for remaining requests to complete.")
 }
 
 func stdinReader() {
 	defer close(urls)
 
-	var line_str string
-	var line_url *url.URL
+	var line string
+	var u *url.URL
 	var err error
 	stdinReader := bufio.NewReader(os.Stdin)
 	for {
-		line, read_err := stdinReader.ReadBytes('\n')
-		if read_err != nil && read_err != io.EOF {
+		lineBytes, readErr := stdinReader.ReadBytes('\n')
+		if readErr != nil && readErr != io.EOF {
 			panic("At ReadBytes")
 			return
 		}
 
-		line = bytes.TrimSpace(line)
-		if len(line) == 0 {
+		lineBytes = bytes.TrimSpace(lineBytes)
+		if len(lineBytes) == 0 {
 			goto Next
 		}
-		line_str = string(line)
+		line = string(lineBytes)
 
-		line_url, err = url.Parse(line_str)
+		u, err = url.Parse(line)
 		if err != nil {
-			result := ErrorResult(line_str, err.Error())
-			report_json, _ := encodeResult(line_str, result)
-			reports <- report_json
+			u = &url.URL{
+				Host: line,
+			}
+			result := heroshi.ErrorResult(u, err.Error())
+			reportJson, _ := encodeResult(line, result)
+			reports <- reportJson
 		} else {
-			urls <- line_url
+			urls <- u
 		}
 
 	Next:
-		if read_err == io.EOF {
+		if readErr == io.EOF {
 			return
 		}
 	}
 }
 
-func encodeResult(key string, result *FetchResult) (encoded []byte, err error) {
+func encodeResult(key string, result *heroshi.FetchResult) (encoded []byte, err error) {
 	// Copy of FetchResult struct with new field Key and base64-encoded Body.
 	// This is ugly and violates DRY principle.
 	// But also, it allows to extract fetcher as separate package.
@@ -75,33 +76,51 @@ func encodeResult(key string, result *FetchResult) (encoded []byte, err error) {
 		Success    bool                `json:"success"`
 		Status     string              `json:"status"`
 		StatusCode int                 `json:"status_code"`
-		Headers    map[string][]string `json:"headers"`
-		Content    string              `json:"content"`
-		Length     int64               `json:"length"`
+		Headers    map[string][]string `json:"headers,omitempty"`
+		Content    string              `json:"content,omitempty"`
+		Length     int64               `json:"length,omitempty"`
 		Cached     bool                `json:"cached"`
-		Visited    string              `json:"visited"`
-		FetchTime  uint                `json:"fetch_time"`
-		TotalTime  uint                `json:"total_time"`
+		FetchTime  uint                `json:"fetch_time,omitempty"`
+		TotalTime  uint                `json:"total_time,omitempty"`
+		// new
+		RemoteAddr     string `json:"address"`
+		Started        string `json:"started"`
+		ConnectionAge  uint   `json:"connection_age"`
+		ConnectionUse  uint   `json:"connection_use"`
+		ConnectTime    uint   `json:"connect_time"`
+		WriteTime      uint   `json:"write_time,omitempty"`
+		ReadHeaderTime uint   `json:"read_header_time,omitempty"`
+		ReadBodyTime   uint   `json:"read_body_time,omitempty"`
 	}
 	report.Key = key
-	report.Url = result.Url
+	report.Url = result.Url.String()
 	report.Success = result.Success
 	report.Status = result.Status
 	report.StatusCode = result.StatusCode
 	report.Headers = result.Headers
 	report.Cached = result.Cached
-	report.Visited = time.Now().UTC().Format(HeroshiTimeFormat)
 	report.FetchTime = result.FetchTime
 	report.TotalTime = result.TotalTime
 	content_encoded := make([]byte, base64.StdEncoding.EncodedLen(len(result.Body)))
 	base64.StdEncoding.Encode(content_encoded, result.Body)
 	report.Content = string(content_encoded)
 	report.Length = result.Length
+	// new
+	if result.Stat != nil {
+		report.RemoteAddr = result.Stat.RemoteAddr.String()
+		report.Started = result.Stat.Started.UTC().Format(time.RFC3339)
+		report.ConnectionAge = uint(result.Stat.ConnectionAge / time.Millisecond)
+		report.ConnectionUse = result.Stat.ConnectionUse
+		report.ConnectTime = uint(result.Stat.ConnectTime / time.Millisecond)
+		report.WriteTime = uint(result.Stat.WriteTime / time.Millisecond)
+		report.ReadHeaderTime = uint(result.Stat.ReadHeaderTime / time.Millisecond)
+		report.ReadBodyTime = uint(result.Stat.ReadBodyTime / time.Millisecond)
+	}
 
 	encoded, err = json.Marshal(report)
 	if err != nil {
 		encoded = nil
-		fmt.Fprintf(os.Stderr, "Url: %s, error encoding report: %s\n",
+		log.Printf("Url: %s, error encoding report: %s\n",
 			result.Url, err.Error())
 
 		// Most encoding errors happen in content. Try to recover.
@@ -112,7 +131,7 @@ func encodeResult(key string, result *FetchResult) (encoded []byte, err error) {
 		encoded, err = json.Marshal(report)
 		if err != nil {
 			encoded = nil
-			fmt.Fprintf(os.Stderr, "Url: %s, error encoding recovery report: %s\n",
+			log.Printf("Url: %s, error encoding recovery report: %s\n",
 				result.Url, err.Error())
 		}
 	}
@@ -135,27 +154,28 @@ func main() {
 
 	// Process command line arguments.
 	var max_concurrency uint
-	flag.UintVar(&max_concurrency, "jobs", DefaultConcurrency, "Try to crawl this many URLs in parallel.")
+	flag.UintVar(&max_concurrency, "jobs", 1000, "Try to crawl this many URLs in parallel.")
 	flag.UintVar(&worker.FollowRedirects, "redirects", 10, "How many redirects to follow. Can be 0.")
 	flag.UintVar(&worker.KeepAlive, "keepalive", 120, "Keep persistent connections to servers for this many seconds.")
 	flag.BoolVar(&worker.SkipRobots, "skip-robots", false, "Don't request and obey robots.txt.")
 	flag.BoolVar(&worker.SkipBody, "skip-body", false, "Don't return response body in results.")
-	flag.DurationVar(&worker.IOTimeout, "io-timeout", 30*time.Second, "Timeout for single socket operation (read, write).")
+	flag.DurationVar(&worker.ConnectTimeout, "connect-timeout", 15*time.Second, "Timeout to query DNS and establish TCP connection.")
+	flag.DurationVar(&worker.IOTimeout, "io-timeout", 30*time.Second, "Timeout for sending request and receiving response (applied for each, so total time is twice this timeout).")
 	flag.DurationVar(&worker.FetchTimeout, "total-timeout", 60*time.Second, "Total timeout for crawling one URL. Includes all network IO, fetching and checking robots.txt.")
 	show_help := flag.Bool("help", false, "")
 	flag.Parse()
 	if max_concurrency <= 0 {
-		fmt.Fprintln(os.Stderr, "Invalid concurrency limit:", max_concurrency)
+		log.Println("Invalid concurrency limit:", max_concurrency)
 		os.Exit(1)
 	}
 	if *show_help {
-		fmt.Fprint(os.Stderr, `Heroshi IO worker.
+		os.Stderr.WriteString(`HTTP client.
 Reads URLs on stdin, fetches them and writes results as JSON on stdout.
 
-By default, follows up to 10 redirects.
-By default, fetches /robots.txt first and obeys rules there.
+Follows up to 10 redirects.
+Fetches /robots.txt first and obeys rules there using User-Agent "Bot/0.4".
 
-Try 'echo http://localhost/ | http-client' to see sample of result JSON.
+Try 'echo http://localhost/ |http-client' to see sample of result JSON.
 `)
 		os.Exit(1)
 	}
