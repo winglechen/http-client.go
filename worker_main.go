@@ -13,6 +13,8 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"runtime/pprof"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -20,15 +22,8 @@ import (
 var urls chan *url.URL
 var reports chan []byte
 
-func handleSigInt(ch <-chan os.Signal) {
-	defer close(urls)
-
-	<-ch
-	log.Println("Waiting for remaining requests to complete.")
-}
-
-func stdinReader() {
-	defer close(urls)
+func stdinReader(stop chan bool) {
+	defer func() { stop <- true }()
 
 	var line string
 	var u *url.URL
@@ -83,7 +78,7 @@ func encodeResult(key string, result *heroshi.FetchResult) (encoded []byte, err 
 		FetchTime  uint                `json:"fetch_time,omitempty"`
 		TotalTime  uint                `json:"total_time,omitempty"`
 		// new
-		RemoteAddr     string `json:"address"`
+		RemoteAddr     string `json:"address,omitempty"`
 		Started        string `json:"started"`
 		ConnectionAge  uint   `json:"connection_age"`
 		ConnectionUse  uint   `json:"connection_use"`
@@ -101,13 +96,15 @@ func encodeResult(key string, result *heroshi.FetchResult) (encoded []byte, err 
 	report.Cached = result.Cached
 	report.FetchTime = result.FetchTime
 	report.TotalTime = result.TotalTime
-	content_encoded := make([]byte, base64.StdEncoding.EncodedLen(len(result.Body)))
-	base64.StdEncoding.Encode(content_encoded, result.Body)
-	report.Content = string(content_encoded)
+	contentEncoded := make([]byte, base64.StdEncoding.EncodedLen(len(result.Body)))
+	base64.StdEncoding.Encode(contentEncoded, result.Body)
+	report.Content = string(contentEncoded)
 	report.Length = result.Length
 	// new
 	if result.Stat != nil {
-		report.RemoteAddr = result.Stat.RemoteAddr.String()
+		if result.Stat.RemoteAddr != nil {
+			report.RemoteAddr = result.Stat.RemoteAddr.String()
+		}
 		report.Started = result.Stat.Started.UTC().Format(time.RFC3339)
 		report.ConnectionAge = uint(result.Stat.ConnectionAge / time.Millisecond)
 		report.ConnectionUse = result.Stat.ConnectionUse
@@ -153,89 +150,131 @@ func main() {
 	urls = make(chan *url.URL)
 
 	// Process command line arguments.
-	var max_concurrency uint
-	flag.UintVar(&max_concurrency, "jobs", 1000, "Try to crawl this many URLs in parallel.")
+	var maxConcurrency uint
+	flag.UintVar(&maxConcurrency, "jobs", 1000, "Try to crawl this many URLs in parallel.")
+	flag.UintVar(&worker.HostConcurrency, "host-jobs", 1, "Per-host concurrency. RFC2616 tells it SHOULD NOT be > 2.")
 	flag.UintVar(&worker.FollowRedirects, "redirects", 10, "How many redirects to follow. Can be 0.")
-	flag.UintVar(&worker.KeepAlive, "keepalive", 120, "Keep persistent connections to servers for this many seconds.")
 	flag.BoolVar(&worker.SkipRobots, "skip-robots", false, "Don't request and obey robots.txt.")
 	flag.BoolVar(&worker.SkipBody, "skip-body", false, "Don't return response body in results.")
 	flag.DurationVar(&worker.ConnectTimeout, "connect-timeout", 15*time.Second, "Timeout to query DNS and establish TCP connection.")
-	flag.DurationVar(&worker.IOTimeout, "io-timeout", 30*time.Second, "Timeout for sending request and receiving response (applied for each, so total time is twice this timeout).")
 	flag.DurationVar(&worker.FetchTimeout, "total-timeout", 60*time.Second, "Total timeout for crawling one URL. Includes all network IO, fetching and checking robots.txt.")
-	show_help := flag.Bool("help", false, "")
+	flag.DurationVar(&worker.IOTimeout, "io-timeout", 30*time.Second, "Timeout for sending request and receiving response (applied for each, so total time is twice this timeout).")
+	flag.DurationVar(&worker.KeepaliveTimeout, "keepalive-timeout", 120*time.Second, "Timeout for keeping persistent connections to servers since last operation.")
+	flag.Uint64Var(&worker.ReadLimit, "read-limit", DefaultReadLimit, "Limit size of response (including headers and body) in bytes.")
+	flag.StringVar(&worker.UserAgent, "user-agent", DefaultUserAgent, "User-Agent header. It is highly recommended to replace unknown_owner with your contact email.")
+	showHelp := flag.Bool("help", false, "")
+	cpuprofile := flag.String("cpuprofile", "", "Write CPU profile to file")
+	memprofile := flag.String("memprofile", "", "Write memory profile to file")
+
 	flag.Parse()
-	if max_concurrency <= 0 {
-		log.Println("Invalid concurrency limit:", max_concurrency)
+	if maxConcurrency <= 0 {
+		log.Println("Invalid concurrency limit:", maxConcurrency)
 		os.Exit(1)
 	}
-	if *show_help {
+	if *showHelp {
 		os.Stderr.WriteString(`HTTP client.
 Reads URLs on stdin, fetches them and writes results as JSON on stdout.
 
 Follows up to 10 redirects.
-Fetches /robots.txt first and obeys rules there using User-Agent "Bot/0.4".
+Fetches /robots.txt first and obeys rules there using first word of User-Agent to test against rules.
 
 Try 'echo http://localhost/ |http-client' to see sample of result JSON.
+
+Run 'http-client -h' for flags description.
 `)
 		os.Exit(1)
 	}
 
-	reports = make(chan []byte, max_concurrency)
-	done_writing := make(chan bool)
-
-	sig_int_chan := make(chan os.Signal, 1)
-	signal.Notify(sig_int_chan, syscall.SIGINT)
-	go handleSigInt(sig_int_chan)
-
-	go stdinReader()
-	go reportWriter(done_writing)
-
-	limit := make(chan bool, max_concurrency)
-	busy_count := make(chan uint, 1)
-	url_count := 0
-
-	busyCountGet := func() uint {
-		n := <-busy_count
-		busy_count <- n
-		return n
+	if *cpuprofile != "" {
+		f, err := os.Create(*cpuprofile)
+		if err != nil {
+			log.Println(err.Error())
+			os.Exit(1)
+		}
+		pprof.StartCPUProfile(f)
+		defer pprof.StopCPUProfile()
+		defer f.Close()
 	}
+	if *memprofile != "" {
+		f, err := os.Create(*memprofile)
+		if err != nil {
+			log.Println(err.Error())
+			os.Exit(1)
+		}
+		go func() {
+			for {
+				time.Sleep(5 * time.Second)
+				pprof.WriteHeapProfile(f)
+			}
+		}()
+		defer pprof.WriteHeapProfile(f)
+		defer f.Close()
+	}
+
+	reports = make(chan []byte, maxConcurrency)
+	stop := make(chan bool)
+	doneWriting := make(chan bool)
+
+	sigIntChan := make(chan os.Signal, 1)
+	signal.Notify(sigIntChan, syscall.SIGINT)
+	go func() {
+		<-sigIntChan
+		log.Println("Waiting for remaining requests to complete.")
+		stop <- true
+	}()
+
+	go stdinReader(stop)
+	go reportWriter(doneWriting)
+
+	limit := make(chan bool, maxConcurrency)
+	var urlCount uint64 = 0
+	busy := sync.WaitGroup{}
 
 	processUrl := func(url *url.URL) {
 		result := worker.Fetch(url)
-		report_json, _ := encodeResult(url.String(), result)
+		reportJson, _ := encodeResult(url.String(), result)
 
 		// nil report is really unrecoverable error. Check stderr.
-		if report_json != nil {
-			reports <- report_json
+		if reportJson != nil {
+			reports <- reportJson
 		}
 
-		busy_count <- (<-busy_count - 1) // atomic decrement
+		busy.Done()
 		<-limit
 	}
 
-	busy_count <- 0
-	for url := range urls {
-		limit <- true
-		url_count++
-		busy_count <- (<-busy_count + 1) // atomic increment
-		go processUrl(url)
+readUrlsLoop:
+	for {
+		select {
+		case u, ok := <-urls:
+			if !ok {
+				break readUrlsLoop
+			}
+			limit <- true
+			urlCount++
+			busy.Add(1)
+			go processUrl(u)
 
-		if url_count%20 == 0 {
-			// TODO:
-			//println("--- URL #", url_count, "Worker has", len(worker.client.HttpClient.Transport), "clients.")
-			println("--- URL #", url_count, "Worker has", -1, "clients.")
-			runtime.GC()
+			if urlCount%20 == 0 {
+				nHosts, nConns := worker.hostLimits.Size()
+				println("--- URL #", urlCount, "Open", nConns, "connections to", nHosts, "hosts.")
+			}
+		case <-stop:
+			close(urls)
+			break readUrlsLoop
 		}
 	}
 
-	// Ugly poll until all urls are processed.
-	for n := busyCountGet(); n > 0; n = busyCountGet() {
-		time.Sleep(1 * time.Second)
-		// TODO:
-		//println("--- URL #", url_count, "Worker has", len(worker.clients), "clients.")
-		println("--- URL #", url_count, "Worker has", -1, "clients.")
-		runtime.GC()
-	}
+	go func() {
+		for {
+			time.Sleep(1 * time.Second)
+			nHosts, nConns := worker.hostLimits.Size()
+			println("--- URL #", urlCount, "Open", nConns, "connections to", nHosts, "hosts.")
+			runtime.GC()
+		}
+	}()
+
+	busy.Wait()
 	close(reports)
-	<-done_writing
+	<-doneWriting
 }

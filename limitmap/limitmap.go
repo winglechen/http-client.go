@@ -16,20 +16,8 @@
 package limitmap
 
 import (
-	"flag"
-	"math/rand"
-	"os"
-	"runtime"
-	"runtime/pprof"
 	"sync"
 )
-
-func maybeSwitch() {
-	// if rand.Intn(20) == 0 {
-	if false {
-		runtime.Gosched()
-	}
-}
 
 // Internal structure, may be changed.
 // Requirements for this data structure:
@@ -54,20 +42,14 @@ func NewSemaphore(max uint) *Semaphore {
 }
 
 func (s *Semaphore) Acquire() uint {
-	maybeSwitch()
 	s.wait.L.Lock()
 	defer s.wait.L.Unlock()
-	maybeSwitch()
 	for i := 0; ; i++ {
-		maybeSwitch()
 		if uint(s.value)+1 <= s.max {
-			maybeSwitch()
 			s.value++
 			return s.value
 		}
-		maybeSwitch()
 		s.wait.Wait()
-		maybeSwitch()
 	}
 	panic("Unexpected branch")
 }
@@ -75,15 +57,11 @@ func (s *Semaphore) Acquire() uint {
 func (s *Semaphore) Release() (result uint) {
 	s.wait.L.Lock()
 	defer s.wait.L.Unlock()
-	maybeSwitch()
 	s.value--
-	maybeSwitch()
 	if s.value < 0 {
 		panic("Semaphore Release without Acquire")
 	}
-	maybeSwitch()
 	s.wait.Signal()
-	maybeSwitch()
 	return
 }
 
@@ -149,65 +127,4 @@ func (m *LimitMap) Size() (keys int, total int) {
 	}
 	m.lk.Unlock()
 	return
-}
-
-func init() {
-	rand.Seed(int64(os.Getpid()))
-}
-
-func main() {
-	var cpuprofile = flag.String("cpuprofile", "", "Write CPU profile to file")
-	flag.Parse()
-	if *cpuprofile != "" {
-		f, err := os.Create(*cpuprofile)
-		if err != nil {
-			os.Stderr.Write([]byte(err.Error()))
-			os.Exit(1)
-		}
-		pprof.StartCPUProfile(f)
-		defer pprof.StopCPUProfile()
-	}
-
-	const N = 1 << 21
-	s := NewSemaphore(5)
-	for i := 1; i <= N; i++ {
-		s.Acquire()
-		s.Acquire()
-		s.Acquire()
-		s.Acquire()
-		s.Acquire()
-		s.Release()
-		s.Release()
-		s.Release()
-		s.Release()
-		s.Release()
-	}
-	/*
-		done := sync.WaitGroup{}
-		limits := NewLimitMap()
-		delay := func(n int) {
-			for i := 1; i < n; i++ {
-				maybeSwitch()
-			}
-		}
-		process := func(key string) {
-			limits.Acquire(key, 2)
-			delay(5)
-			limits.Release(key)
-			done.Done()
-		}
-		done.Add(1)
-		go func() {
-			for i := 0; i < N; i++ {
-				key := "key" + string((i%17)+0x30)
-				done.Add(1)
-				delay(40)
-				go process(key)
-			}
-			done.Done()
-		}()
-		maybeSwitch()
-		limits.Wait()
-		done.Wait()
-	*/
 }

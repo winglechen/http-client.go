@@ -14,67 +14,91 @@ import (
 
 type ConnectionHandler func(*testing.T, net.Conn)
 
-func fastServe(t *testing.T, conn net.Conn) {
-	defer conn.Close()
-
-	br := bufio.NewReader(conn)
-	_, err := http.ReadRequest(br)
-	if err != nil {
-		t.Error("fast:Read:", err.Error())
-	}
-
-	response := []byte("HTTP/1.0 200 OK\r\nConnection: close\r\nContent-Type: text/plain\r\nContent-Length: 100\r\n\r\n1xxxxxxxxx2xxxxxxxxx3xxxxxxxxx4xxxxxxxxx5xxxxxxxxx6xxxxxxxxx7xxxxxxxxx8xxxxxxxxx9xxxxxxxxxaxxxxxxxxx")
-	n, err := conn.Write(response)
-	if err != nil {
-		t.Error("fast:Write:", err.Error())
-	}
-	if n < len(response) {
-		t.Error("fast:Write: written", n, "bytes of", len(response))
-	}
+type SlowReaderWriter struct {
+	R      io.Reader
+	W      io.Writer
+	Size   int
+	RDelay time.Duration
+	WDelay time.Duration
 }
 
-func slowServe(t *testing.T, conn net.Conn) {
-	defer conn.Close()
+func (s *SlowReaderWriter) Read(p []byte) (int, error) {
+	time.Sleep(s.RDelay)
+	size := len(p)
+	if size > s.Size {
+		size = s.Size
+	}
+	return s.R.Read(p[0:size])
+}
 
-	var request []byte
-	buf := make([]byte, 4)
-	for {
-		time.Sleep(10 * time.Millisecond)
-		n, err := conn.Read(buf[0:])
+func (s *SlowReaderWriter) Write(p []byte) (int, error) {
+	total := 0
+	for len(p) > 0 {
+		time.Sleep(s.WDelay)
+		size := s.Size
+		if size > len(p) {
+			size = len(p)
+		}
+		n, err := s.W.Write(p[0:size])
+		total += n
 		if err != nil {
-			t.Error("slow:Read:", err.Error())
-			break
+			return total, err
 		}
-		request = append(request, buf[0:n]...)
-		if request[len(request)-2] == '\r' && request[len(request)-1] == '\n' {
-			break
-		}
+		p = p[n:len(p)]
 	}
-
-	time.Sleep(5 * time.Millisecond)
-	conn.Write([]byte("HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 800\r\n\r\n"))
-	for i := 1; i <= 100; i++ {
-		time.Sleep(5 * time.Millisecond)
-		conn.Write([]byte("response"))
-	}
+	return total, nil
 }
 
-func delayServe(t *testing.T, conn net.Conn) {
-	defer conn.Close()
+func (s *SlowReaderWriter) Close() error {
+	return nil
+}
 
-	br := bufio.NewReader(conn)
-	_, err := http.ReadRequest(br)
-	if err != nil {
-		t.Error("delay:Read:", err.Error())
-	}
+func makeServe(connectionClose bool, processTime time.Duration, bodyLength int, slow *SlowReaderWriter) ConnectionHandler {
+	return func(t *testing.T, conn net.Conn) {
+		defer conn.Close()
 
-	response := []byte("HTTP/1.0 200 OK\r\nConnection: close\r\nContent-Type: text/plain\r\nContent-Length: 19\r\n\r\nEverything is fine.")
-	n, err := conn.Write(response)
-	if err != nil {
-		t.Error("delay:Write:", err.Error())
-	}
-	if n < len(response) {
-		t.Error("fast:delay: written", n, "bytes of", len(response))
+		var br *bufio.Reader = bufio.NewReader(conn)
+		var w io.Writer = conn
+		body := strings.Repeat("x", bodyLength)
+		if slow != nil {
+			slow.R = conn
+			slow.W = conn
+			br = bufio.NewReader(slow)
+			w = io.Writer(slow)
+		}
+
+		for i := 1; i < 10; i++ {
+			request, err := http.ReadRequest(br)
+			if err != nil {
+				t.Error("Read:", err.Error())
+			}
+
+			response := http.Response{
+				Status:     "200 OK",
+				StatusCode: 200,
+				Proto:      "HTTP/1.1",
+				ProtoMajor: 1,
+				ProtoMinor: 1,
+				// No RDelay, used only to provide Close method to strings.Reader.
+				Body:          &SlowReaderWriter{R: strings.NewReader(body), Size: bodyLength},
+				ContentLength: int64(bodyLength),
+				Close:         connectionClose,
+				Header:        make(http.Header),
+				Request:       request,
+			}
+			response.Header.Set("Content-Type", "text/plain")
+			response.Header.Set("Content-Length", fmt.Sprintf("%d", bodyLength))
+
+			// dw := bytes.NewBuffer(make([]byte, 100000))
+			// response.Write(dw)
+			// println("Write:", dw.String())
+
+			err = response.Write(w)
+			if err != nil {
+				t.Error("Write:", err.Error())
+			}
+		}
+		t.Fatal("Too many requests on one connection")
 	}
 }
 
@@ -117,7 +141,7 @@ func TestConnectTimeout(t *testing.T) {
 		t.Fatal("Listen:", err.Error())
 	}
 	stopCh := make(chan bool, 1)
-	go server(t, listener, fastServe, stopCh, 50*time.Millisecond)
+	go server(t, listener, makeServe(true, 0, 1, nil), stopCh, 10*time.Millisecond)
 	defer func() { stopCh <- true }()
 
 	url := fmt.Sprintf("http://%s/slow-connect", listener.Addr().String())
@@ -146,7 +170,7 @@ func TestConnectTimeout(t *testing.T) {
 	}()
 	select {
 	case <-ready:
-	case <-time.After(100 * time.Millisecond):
+	case <-time.After(50 * time.Millisecond):
 		t.Error("Transport did not timeout")
 	}
 }
@@ -157,7 +181,7 @@ func TestReadTimeout(t *testing.T) {
 		t.Fatal("Listen:", err.Error())
 	}
 	stopCh := make(chan bool, 1)
-	go server(t, listener, slowServe, stopCh, 0)
+	go server(t, listener, makeServe(true, 5*time.Millisecond, 1, nil), stopCh, 0)
 	defer func() { stopCh <- true }()
 
 	url := fmt.Sprintf("http://%s/slow-respond", listener.Addr().String())
@@ -196,7 +220,11 @@ func TestWriteTimeout(t *testing.T) {
 		t.Fatal("Listen:", err.Error())
 	}
 	stopCh := make(chan bool, 1)
-	go server(t, listener, slowServe, stopCh, 0)
+	slow := &SlowReaderWriter{
+		Size:   1024,
+		RDelay: 10 * time.Millisecond,
+	}
+	go server(t, listener, makeServe(true, 0, 500, slow), stopCh, 0)
 	defer func() { stopCh <- true }()
 
 	url := fmt.Sprintf("http://%s/slow-receive", listener.Addr().String())
@@ -236,7 +264,7 @@ func TestClose(t *testing.T) {
 		t.Fatal("Listen:", err.Error())
 	}
 	stopCh := make(chan bool, 1)
-	go server(t, listener, delayServe, stopCh, 0)
+	go server(t, listener, makeServe(true, 0, 42, nil), stopCh, 0)
 	defer func() { stopCh <- true }()
 
 	url := fmt.Sprintf("http://%s/delay", listener.Addr().String())
@@ -284,13 +312,13 @@ func TestClose(t *testing.T) {
 	}
 }
 
-func TestReadLimit(t *testing.T) {
+func TestReadLimit01(t *testing.T) {
 	listener, err := net.Listen("tcp", ":0")
 	if err != nil {
 		t.Fatal("Listen:", err.Error())
 	}
 	stopCh := make(chan bool, 1)
-	go server(t, listener, slowServe, stopCh, 0)
+	go server(t, listener, makeServe(true, 0, 4000, nil), stopCh, 0)
 	defer func() { stopCh <- true }()
 
 	url := fmt.Sprintf("http://%s/big", listener.Addr().String())
@@ -327,5 +355,48 @@ func TestReadLimit(t *testing.T) {
 	}
 	if buf.Len() > 100 {
 		t.Fatal("With ReadLimit: limit exceeded")
+	}
+}
+
+// ReadLimit must count from 0 for each new request.
+func TestReadLimitFalseNegative(t *testing.T) {
+	listener, err := net.Listen("tcp", ":0")
+	if err != nil {
+		t.Fatal("Listen:", err.Error())
+	}
+	stopCh := make(chan bool, 1)
+	go server(t, listener, makeServe(false, 0, 700, nil), stopCh, 0)
+	defer func() { stopCh <- true }()
+
+	url := fmt.Sprintf("http://%s/big", listener.Addr().String())
+	request, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		t.Fatal("NewRequest:", err.Error())
+	}
+
+	transport := &Transport{}
+	options := &RequestOptions{ReadLimit: 1000}
+	buf := make([]byte, options.ReadLimit)
+
+	for i := 1; i <= 5; i++ {
+		options.Stat = &RequestStat{}
+		response, err := transport.RoundTripOptions(request, options)
+		if err != nil {
+			t.Fatal("RoundTrip:", err.Error())
+		}
+		if response.StatusCode != 200 {
+			t.Fatal("RoundTrip: status!=200")
+		}
+		n, err := response.Body.Read(buf)
+		response.Body.Close()
+		if n == len(buf) {
+			t.Fatal("The buf is not enough!")
+		}
+		if err != nil {
+			t.Fatal("Body.Read:", err.Error())
+		}
+		if options.Stat.ConnectionUse != uint(i) {
+			t.Fatal("Loop:", i, "ConnectionUse:", options.Stat.ConnectionUse)
+		}
 	}
 }

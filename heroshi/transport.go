@@ -238,7 +238,7 @@ func (t *Transport) dial(network, addr string, opt *RequestOptions) (c net.Conn,
 	}
 
 	// Custom Dial may have provide these values, do not overwrite.
-	if opt != nil && opt.Stat != nil && opt.Stat.RemoteAddr == nil {
+	if err == nil && opt != nil && opt.Stat != nil && opt.Stat.RemoteAddr == nil {
 		opt.Stat.RemoteAddr = c.RemoteAddr()
 		opt.Stat.ConnectionAge = 0
 		opt.Stat.ConnectionUse = 1
@@ -300,11 +300,6 @@ func (t *Transport) GetConn(cm *ConnectMethod, opt *RequestOptions) (*PersistCon
 		pconn.conn = conn
 	}
 
-	var reader io.Reader = pconn.conn
-	if opt != nil && opt.ReadLimit != 0 {
-		reader = io.LimitReader(reader, int64(opt.ReadLimit))
-	}
-	pconn.br = bufio.NewReader(reader)
 	pconn.bw = bufio.NewWriter(pconn.conn)
 	go pconn.readLoop(func(pc *PersistConn) bool { return t.putIdleConn(pc) })
 	return pconn, nil
@@ -349,7 +344,6 @@ func (cm *ConnectMethod) tlsHost() string {
 type PersistConn struct {
 	cacheKey    string // its ConnectMethod.String()
 	conn        net.Conn
-	br          *bufio.Reader          // from conn
 	bw          *bufio.Writer          // to conn
 	reqch       chan requestAndOptions // written by WriteRequest(); read by readLoop()
 	rech        chan responseAndError  // read by ReadResponse
@@ -387,7 +381,10 @@ func (pc *PersistConn) readLoop(putIdleConn func(*PersistConn) bool) {
 	var lastbody io.ReadCloser // last response body, if any, read on this connection
 
 	for alive {
-		pb, err := pc.br.Peek(1)
+		limitedReader := &io.LimitedReader{R: pc.conn, N: 1}
+		br := bufio.NewReader(limitedReader)
+
+		pb, err := br.Peek(1)
 
 		pc.lk.Lock()
 		if pc.numExpectedResponses == 0 {
@@ -417,17 +414,24 @@ func (pc *PersistConn) readLoop(putIdleConn func(*PersistConn) bool) {
 			lastbody = nil
 		}
 
+		// Set read limit, if any.
+		if rc.opt != nil && rc.opt.ReadLimit != 0 {
+			limitedReader.N = int64(rc.opt.ReadLimit)
+		} else {
+			limitedReader.N = 1<<63 - 1
+		}
+
 		// Separate started variable because pc.lastUsed may be updated concurrently.
 		var started time.Time = time.Now()
 		pc.lastUsed = started
 
 		var resp *http.Response
 		if rc.opt == nil || rc.opt.ReadTimeout == 0 {
-			resp, err = http.ReadResponse(pc.br, rc.req)
+			resp, err = http.ReadResponse(br, rc.req)
 		} else {
 			ch := make(chan responseAndError, 0)
 			go func() {
-				r, e := http.ReadResponse(pc.br, rc.req)
+				r, e := http.ReadResponse(br, rc.req)
 				ch <- responseAndError{r, e}
 			}()
 			select {

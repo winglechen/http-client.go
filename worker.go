@@ -17,6 +17,9 @@ import (
 	//"json"
 )
 
+const DefaultUserAgent = "HeroshiBot/1 (unknown_owner; +http://temoto.github.com/heroshi/)"
+const DefaultReadLimit = 10 << 20 // 10MB
+
 type Worker struct {
 	// When false (default), worker will obey /robots.txt
 	// when true, any URL is allowed to visit.
@@ -42,11 +45,13 @@ type Worker struct {
 	// Default is 1 minute. DO NOT use 0.
 	FetchTimeout time.Duration
 
-	// How long to keep persistent connections, in seconds. Default is 60.
-	KeepAlive uint
+	ReadLimit uint64
 
-	// Maximum number of connections per domain:port pair. Default is 2.
-	DomainConcurrency uint
+	// How long to keep persistent connections. Default is 60 seconds.
+	KeepaliveTimeout time.Duration
+
+	// Maximum number of connections per domain:port pair. Default is 1.
+	HostConcurrency uint
 
 	// User-Agent as it's sent to server
 	// robotsAgent (first word of UserAgent) is verified against robots.txt.
@@ -54,20 +59,21 @@ type Worker struct {
 	robotsAgent string
 
 	//cache redis.Client
-	domainLimits *limitmap.LimitMap
-	transport    *heroshi.Transport
+	hostLimits *limitmap.LimitMap
+	transport  *heroshi.Transport
 }
 
 func newWorker() *Worker {
 	w := &Worker{
-		FollowRedirects:   1,
-		ConnectTimeout:    1 * time.Second,
-		IOTimeout:         1 * time.Second,
-		FetchTimeout:      60 * time.Second,
-		KeepAlive:         60,
-		DomainConcurrency: 2,
-		UserAgent:         "HeroshiBot/1 (unknown_owner; +http://temoto.github.com/heroshi/)",
-		domainLimits:      limitmap.NewLimitMap(),
+		FollowRedirects:  1,
+		ConnectTimeout:   1 * time.Second,
+		IOTimeout:        1 * time.Second,
+		FetchTimeout:     60 * time.Second,
+		ReadLimit:        DefaultReadLimit,
+		KeepaliveTimeout: 60 * time.Second,
+		HostConcurrency:  1,
+		UserAgent:        DefaultUserAgent,
+		hostLimits:       limitmap.NewLimitMap(),
 		transport: &heroshi.Transport{
 			Dial:                Dial,
 			MaxIdleConnsPerHost: 1,
@@ -80,8 +86,8 @@ func newWorker() *Worker {
 // Downloads url and returns whatever result was.
 // This function WILL NOT follow redirects.
 func (w *Worker) Download(url *url.URL) (result *heroshi.FetchResult) {
-	w.domainLimits.Acquire(url.Host, w.DomainConcurrency)
-	defer w.domainLimits.Release(url.Host)
+	w.hostLimits.Acquire(url.Host, w.HostConcurrency)
+	defer w.hostLimits.Release(url.Host)
 
 	req, err := http.NewRequest("GET", url.String(), nil)
 	if err != nil {
@@ -90,11 +96,12 @@ func (w *Worker) Download(url *url.URL) (result *heroshi.FetchResult) {
 	req.Header.Set("User-Agent", w.UserAgent)
 
 	options := &heroshi.RequestOptions{
-		ConnectTimeout: w.IOTimeout,
-		ReadTimeout:    w.IOTimeout,
-		WriteTimeout:   w.IOTimeout,
-		ReadLimit:      10 << 20, //10MB
-		Stat:           new(heroshi.RequestStat),
+		ConnectTimeout:   w.ConnectTimeout,
+		ReadTimeout:      w.IOTimeout,
+		WriteTimeout:     w.IOTimeout,
+		ReadLimit:        w.ReadLimit,
+		KeepaliveTimeout: w.KeepaliveTimeout,
+		Stat:             new(heroshi.RequestStat),
 	}
 	result = heroshi.Fetch(w.transport, req, options, w.FetchTimeout)
 	if w.SkipBody {
