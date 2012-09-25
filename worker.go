@@ -3,8 +3,8 @@ package main
 import (
 	"errors"
 	"fmt"
-	"github.com/temoto/http-client/heroshi"  // Temporary location
-	"github.com/temoto/http-client/limitmap" // Temporary location
+	"github.com/temoto/http-client.go/heroshi"  // Temporary location
+	"github.com/temoto/http-client.go/limitmap" // Temporary location
 	"github.com/temoto/robotstxt.go"
 	"net"
 	"net/http"

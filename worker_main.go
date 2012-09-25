@@ -6,7 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"flag"
-	"github.com/temoto/http-client/heroshi" // Temporary location
+	"github.com/temoto/http-client.go/heroshi" // Temporary location
 	"io"
 	"log"
 	"net/url"
