@@ -189,18 +189,13 @@ func (w *Worker) AskRobots(url *url.URL) (bool, *heroshi.FetchResult) {
 	}
 
 	var robots *robotstxt.RobotsData
-	robots, err = robotstxt.FromResponseBytes(fetch_result.StatusCode, fetch_result.Body, false)
+	robots, err = robotstxt.FromStatusAndBytes(fetch_result.StatusCode, fetch_result.Body)
 	if err != nil {
 		fetch_result.Status = "Robots parse error: " + err.Error()
 		return false, fetch_result
 	}
 
-	var allow bool
-	allow, err = robots.TestAgent(url.Path, w.UserAgent)
-	if err != nil {
-		return false, heroshi.ErrorResult(url, "Robots test error: "+err.Error())
-	}
-
+	allow := robots.TestAgent(url.Path, w.UserAgent)
 	if !allow {
 		return allow, heroshi.ErrorResult(url, "Robots disallow")
 	}
